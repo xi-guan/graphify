@@ -10,6 +10,7 @@ from pathlib import Path
 from collections.abc import Sequence
 from typing import Any
 
+from graphify.ids import make_id as _shared_make_id
 from graphify.security import sanitize_metadata
 
 
@@ -357,22 +358,32 @@ def resolve_cross_file_raw_calls(
 
 
 def _bash_make_id(*parts: str) -> str:
-    """Exact copy of extract._make_id — kept here to avoid an import cycle."""
-    combined = "_".join(p.strip("_.") for p in parts if p)
-    combined = unicodedata.normalize("NFKC", combined)
-    cleaned = re.sub(r"[^\w]+", "_", combined, flags=re.UNICODE)
-    cleaned = re.sub(r"_+", "_", cleaned)
-    return cleaned.strip("_").casefold()
+    """Bash symbol node ID via the single shared recipe (#1378).
+
+    Previously an inline copy to dodge an import cycle; ``graphify.ids`` is
+    dependency-free, so it can be imported directly.
+    """
+    return _shared_make_id(*parts)
+
+
+def _bash_file_stem(rel_path: Path) -> str:
+    """Exact copy of extract._file_stem — kept here to avoid an import cycle."""
+    parent = rel_path.parent.name
+    if parent and parent not in (".", ""):
+        return f"{parent}.{rel_path.stem}"
+    return rel_path.stem
 
 
 def _file_node_id_for_path(path: Path, root: Path) -> str:
-    # Resolve both sides so callers that pass relative or non-canonical roots
-    # get the same canonical relative path that extract()'s id_remap produces.
-    # _bash_make_id is an exact copy of extract._make_id, so IDs match.
+    # Produce the canonical {parent_dir}_{stem} file-node ID that extract()'s
+    # id_remap generates (#1033), so bash `source` edges land on the real file
+    # node instead of an orphan. _bash_make_id / _bash_file_stem are exact copies
+    # of extract._make_id / extract._file_stem, so IDs match.
     try:
-        return _bash_make_id(str(path.resolve().relative_to(root.resolve())))
+        rel = path.resolve().relative_to(root.resolve())
     except ValueError:
         return _bash_make_id(str(path))  # path outside root: hash absolute path as fallback
+    return _bash_make_id(_bash_file_stem(rel))
 
 
 def resolve_bash_source_edges(

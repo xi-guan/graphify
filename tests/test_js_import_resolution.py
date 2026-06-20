@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from graphify.extract import _file_stem, _make_id, extract
+from graphify.extract import _file_node_id, _file_stem, _make_id, extract
 
 
 def _write(path: Path, text: str) -> Path:
@@ -17,7 +17,7 @@ def _extract_for(paths: list[Path], root: Path):
 
 
 def _has_edge(result: dict, source: str, target: str, relation: str = "imports_from") -> bool:
-    expected = (_make_id(source), _make_id(target), relation)
+    expected = (_file_node_id(Path(source)), _file_node_id(Path(target)), relation)
     actual = {
         (edge["source"], edge["target"], edge["relation"])
         for edge in result["edges"]
@@ -32,7 +32,7 @@ def _has_symbol_edge(
     symbol: str,
     relation: str = "imports",
 ) -> bool:
-    expected = (_make_id(source), _make_id(_file_stem(Path(target_file)), symbol), relation)
+    expected = (_file_node_id(Path(source)), _make_id(_file_stem(Path(target_file)), symbol), relation)
     actual = {
         (edge["source"], edge["target"], edge["relation"])
         for edge in result["edges"]
@@ -334,10 +334,185 @@ def test_tsconfig_alias_import_resolves_existing_ts_file(tmp_path: Path):
     assert _has_edge(result, "src/routes/page.ts", "src/lib/types/type-helpers.ts")
 
 
+def test_tsconfig_alias_with_subdirectory_baseurl_resolves_existing_ts_file(tmp_path: Path):
+    # `paths` are resolved relative to `baseUrl`, which is commonly a
+    # subdirectory in monorepo / NestJS layouts (baseUrl "./src").
+    # Regression: baseUrl was ignored, so "@services/*": ["services/*"] with
+    # baseUrl "./src" resolved to <root>/services instead of <root>/src/services,
+    # and every aliased import edge was silently dropped.
+    _write(
+        tmp_path / "tsconfig.json",
+        json.dumps({"compilerOptions": {"baseUrl": "./src", "paths": {"@services/*": ["services/*"]}}}),
+    )
+    target = _write(tmp_path / "src/services/foo/index.ts", "export class Foo { id = '' }\n")
+    importer = _write(
+        tmp_path / "src/routes/page.ts",
+        "import { Foo } from '@services/foo'\nnew Foo()\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_edge(result, "src/routes/page.ts", "src/services/foo/index.ts")
+
+
+def test_tsconfig_array_extends_alias_resolves_existing_ts_file(tmp_path: Path):
+    # TypeScript 5.0 allows `extends` as an array; later entries override
+    # earlier ones. The `paths` alias is inherited from the second parent.
+    # Regression: an array `extends` previously raised
+    # `AttributeError: 'list' object has no attribute 'startswith'`, which
+    # _safe_extract turned into a skip of every file using the alias.
+    _write(tmp_path / "tsconfig.base.json", json.dumps({"compilerOptions": {"strict": True}}))
+    _write(
+        tmp_path / "tsconfig.paths.json",
+        json.dumps({"compilerOptions": {"baseUrl": ".", "paths": {"$lib/*": ["src/lib/*"]}}}),
+    )
+    _write(
+        tmp_path / "tsconfig.json",
+        json.dumps({"extends": ["./tsconfig.base.json", "./tsconfig.paths.json"]}),
+    )
+    target = _write(tmp_path / "src/lib/types/type-helpers.ts", "export type Helper = string\n")
+    importer = _write(
+        tmp_path / "src/routes/page.ts",
+        "import type { Helper } from '$lib/types/type-helpers'\nconst value: Helper = 'x'\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_edge(result, "src/routes/page.ts", "src/lib/types/type-helpers.ts")
+
+
+def test_default_import_resolves_to_default_exported_class(tmp_path: Path):
+    target = _write(tmp_path / "src/lib/foo.ts", "export default class Foo { id = '' }\n")
+    importer = _write(
+        tmp_path / "src/routes/page.ts",
+        "import Foo from '../lib/foo'\nnew Foo()\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_symbol_edge(result, "src/routes/page.ts", "src/lib/foo.ts", "Foo")
+
+
+def test_default_import_with_renamed_binding_resolves_to_origin(tmp_path: Path):
+    # The local binding may differ from the exported symbol name; the edge must
+    # still target the origin symbol, not the local binding.
+    target = _write(tmp_path / "src/lib/foo.ts", "export default class Foo { id = '' }\n")
+    importer = _write(
+        tmp_path / "src/routes/page.ts",
+        "import Renamed from '../lib/foo'\nnew Renamed()\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_symbol_edge(result, "src/routes/page.ts", "src/lib/foo.ts", "Foo")
+
+
+def test_export_default_identifier_resolves_default_import(tmp_path: Path):
+    target = _write(tmp_path / "src/lib/foo.ts", "class Foo { id = '' }\nexport default Foo\n")
+    importer = _write(
+        tmp_path / "src/routes/page.ts",
+        "import Foo from '../lib/foo'\nnew Foo()\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_symbol_edge(result, "src/routes/page.ts", "src/lib/foo.ts", "Foo")
+
+
+def test_default_import_call_resolves_to_default_exported_function(tmp_path: Path):
+    # Binding a default import also lets calls through it resolve to the origin.
+    # The local binding (`mk`) deliberately differs from the exported name so the
+    # edge can only come from the default-import alias, not global-label matching.
+    target = _write(tmp_path / "src/lib/foo.ts", "export default function makeFoo() { return 1 }\n")
+    importer = _write(
+        tmp_path / "src/routes/page.ts",
+        "import mk from '../lib/foo'\nconst X = () => mk()\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_symbol_to_symbol_edge(
+        result, "src/routes/page.ts", "X", "src/lib/foo.ts", "makeFoo", "calls"
+    )
+
+
 def test_pnpm_workspace_package_import_resolves_package_entry(tmp_path: Path):
     _write(
         tmp_path / "pnpm-workspace.yaml",
         "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+    )
+    _write(
+        tmp_path / "packages/types/package.json",
+        json.dumps({"name": "@workspace/types", "exports": "./src/index.ts"}),
+    )
+    target = _write(
+        tmp_path / "packages/types/src/index.ts",
+        "export interface SomeDto { id: string }\n",
+    )
+    importer = _write(
+        tmp_path / "apps/web/src/page.ts",
+        "import type { SomeDto } from '@workspace/types'\nconst dto: SomeDto = { id: '1' }\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_edge(result, "apps/web/src/page.ts", "packages/types/src/index.ts")
+
+
+def test_npm_workspace_package_import_resolves_package_entry(tmp_path: Path):
+    _write(
+        tmp_path / "package.json",
+        json.dumps({"workspaces": ["apps/*", "packages/*"]}),
+    )
+    _write(
+        tmp_path / "packages/types/package.json",
+        json.dumps({"name": "@workspace/types", "exports": "./src/index.ts"}),
+    )
+    target = _write(
+        tmp_path / "packages/types/src/index.ts",
+        "export interface SomeDto { id: string }\n",
+    )
+    importer = _write(
+        tmp_path / "apps/web/src/page.ts",
+        "import type { SomeDto } from '@workspace/types'\nconst dto: SomeDto = { id: '1' }\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_edge(result, "apps/web/src/page.ts", "packages/types/src/index.ts")
+
+
+def test_yarn_workspace_package_import_resolves_package_entry(tmp_path: Path):
+    _write(
+        tmp_path / "package.json",
+        json.dumps({"workspaces": {"packages": ["apps/*", "packages/*"]}}),
+    )
+    _write(
+        tmp_path / "packages/types/package.json",
+        json.dumps({"name": "@workspace/types", "exports": "./src/index.ts"}),
+    )
+    target = _write(
+        tmp_path / "packages/types/src/index.ts",
+        "export interface SomeDto { id: string }\n",
+    )
+    importer = _write(
+        tmp_path / "apps/web/src/page.ts",
+        "import type { SomeDto } from '@workspace/types'\nconst dto: SomeDto = { id: '1' }\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_edge(result, "apps/web/src/page.ts", "packages/types/src/index.ts")
+
+
+def test_pnpm_workspace_takes_precedence_over_package_json_workspaces(tmp_path: Path):
+    _write(
+        tmp_path / "pnpm-workspace.yaml",
+        "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+    )
+    _write(
+        tmp_path / "package.json",
+        json.dumps({"workspaces": ["other/*"]}),
     )
     _write(
         tmp_path / "packages/types/package.json",
@@ -397,3 +572,67 @@ def test_workspace_package_cache_refreshes_between_extract_calls(tmp_path: Path)
     second = _extract_for([target, importer], tmp_path)
 
     assert _has_edge(second, "apps/web/src/page.ts", "packages/types/src/index.ts")
+
+
+def test_pnpm_workspace_dot_package_does_not_crash(tmp_path: Path):
+    """packages: - '.' in pnpm-workspace.yaml must not raise IndexError on any Python version."""
+    _write(
+        tmp_path / "pnpm-workspace.yaml",
+        "packages:\n  - '.'\n  - 'examples/*'\n",
+    )
+    _write(
+        tmp_path / "package.json",
+        json.dumps({"name": "my-app"}),
+    )
+    src = _write(
+        tmp_path / "index.ts",
+        "import { foo } from 'my-app';\n",
+    )
+
+    result = _extract_for([src], tmp_path)
+
+    nodes = result.get("nodes", [])
+    assert isinstance(nodes, list)
+    for node in nodes:
+        error = node.get("error", "") if isinstance(node, dict) else ""
+        assert "IndexError" not in error
+
+
+def test_ts_type_relationships_and_contexts(tmp_path: Path):
+    base = _write(
+        tmp_path / "src/lib/base.ts",
+        "export interface IProcessor<T> { run(input: T): Result<T> }\n"
+        "export abstract class BaseProcessor {}\n"
+        "export type Result<T> = { value: T }\n"
+        "export class Payload {}\n",
+    )
+    impl = _write(
+        tmp_path / "src/lib/impl.ts",
+        "import type { IProcessor, BaseProcessor, Result, Payload } from './base'\n"
+        "export abstract class DataProcessor extends BaseProcessor implements IProcessor<Payload> {\n"
+        "  current!: Result<Payload>\n"
+        "  run(input: Payload): Result<Payload> { return this.current }\n"
+        "}\n",
+    )
+
+    result = _extract_for([base, impl], tmp_path)
+    labels = {node["id"]: node["label"] for node in result["nodes"]}
+
+    def _norm(label: str) -> str:
+        return label.strip("()").lstrip(".")
+
+    reference_contexts = {
+        (
+            _norm(labels.get(edge["source"], edge["source"])),
+            _norm(labels.get(edge["target"], edge["target"])),
+            edge.get("context"),
+        )
+        for edge in result["edges"]
+        if edge.get("relation") == "references"
+    }
+
+    assert _has_symbol_to_symbol_edge(result, "src/lib/impl.ts", "DataProcessor", "src/lib/base.ts", "BaseProcessor", "inherits")
+    assert _has_symbol_to_symbol_edge(result, "src/lib/impl.ts", "DataProcessor", "src/lib/base.ts", "IProcessor", "implements")
+    assert ("run", "Payload", "parameter_type") in reference_contexts
+    assert ("run", "Result", "return_type") in reference_contexts
+    assert ("run", "Payload", "generic_arg") in reference_contexts

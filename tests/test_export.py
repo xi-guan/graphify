@@ -180,6 +180,19 @@ def test_to_canvas_file_paths_relative_to_vault():
             assert node["file"].endswith(".md")
 
 
+def test_to_canvas_no_communities_still_populates():
+    """#1324: empty communities (e.g. --no-cluster builds) on a populated graph
+    must NOT produce the 32-byte empty `{"nodes": [], "edges": []}` shell."""
+    G = make_graph()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.canvas"
+        to_canvas(G, {}, str(out))  # no community data — the bug condition
+        data = json.loads(out.read_text())
+        assert len(data["nodes"]) >= G.number_of_nodes()
+        assert len(data["edges"]) >= 1
+        assert out.stat().st_size > 32
+
+
 # ── Issue #834: backup_if_protected ──────────────────────────────────────────
 
 def test_backup_no_graph_json(tmp_path):
@@ -228,8 +241,8 @@ def test_backup_default_labels_only(tmp_path):
     assert backup_if_protected(tmp_path) is None
 
 
-def test_backup_same_day_collision(tmp_path):
-    """Second backup on same day gets _2 suffix."""
+def test_backup_same_day_no_accumulation(tmp_path):
+    """Same content on same day returns existing backup dir without re-copying."""
     from graphify.export import backup_if_protected
     from datetime import date
     (tmp_path / "graph.json").write_text('{"nodes":[],"links":[]}')
@@ -237,8 +250,21 @@ def test_backup_same_day_collision(tmp_path):
     b1 = backup_if_protected(tmp_path)
     b2 = backup_if_protected(tmp_path)
     assert b1 is not None and b2 is not None
-    assert b1 != b2
-    assert b2.name == f"{date.today().isoformat()}_2"
+    assert b1 == b2  # same dir, no _2 accumulation
+    assert b1.name == date.today().isoformat()
+
+
+def test_backup_same_day_changed_content(tmp_path):
+    """Changed graph.json on same day overwrites the existing backup in place."""
+    from graphify.export import backup_if_protected
+    from datetime import date
+    (tmp_path / "graph.json").write_text('{"nodes":[],"links":[]}')
+    (tmp_path / ".graphify_semantic_marker").write_text("{}")
+    b1 = backup_if_protected(tmp_path)
+    (tmp_path / "graph.json").write_text('{"nodes":[{"id":"x"}],"links":[]}')
+    b2 = backup_if_protected(tmp_path)
+    assert b1 == b2  # still one folder per day
+    assert (b2 / "graph.json").read_text() == '{"nodes":[{"id":"x"}],"links":[]}'
 
 
 def test_backup_env_disable(tmp_path, monkeypatch):
