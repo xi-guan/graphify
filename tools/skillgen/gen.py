@@ -61,6 +61,12 @@ def _v8_baseline_ref(platform_key: str) -> str:
     """The git ref for a split host's own pre-split skill body."""
     if platform_key == "claude":
         return f"{_V8_BASELINE_SHA}:graphify/skill.md"
+    if platform_key == "agents":
+        # `agents` is a post-v8 platform with no own v8 body — it re-homes amp's
+        # agents-md body at the generic ~/.agents/skills location. Its render is
+        # amp's modulo the install/uninstall command wording (prose, not headings),
+        # so amp's v8 body is the correct per-host coverage baseline.
+        return f"{_V8_BASELINE_SHA}:graphify/skill-amp.md"
     return f"{_V8_BASELINE_SHA}:graphify/skill-{platform_key}.md"
 
 # Immutable baseline for --always-on-roundtrip. The six always-on instruction
@@ -84,6 +90,27 @@ ALWAYS_ON_BLOCKS = {
     "vscode-instructions": "_VSCODE_INSTRUCTIONS_SECTION",
     "antigravity-rules": "_ANTIGRAVITY_RULES",
     "kiro-steering": "_KIRO_STEERING",
+}
+
+# Sanctioned divergences from the frozen always-on baseline above. The roundtrip
+# guard deliberately does NOT track HEAD, so any *intentional* change to an
+# always-on instruction block must be recorded here as an explicit, reviewable
+# old -> new substitution keyed by the baseline constant. The guard applies these
+# to the baseline before the byte-for-byte comparison; anything not covered here
+# still fails the guard, so unrelated drift cannot slip through. Each entry is a
+# one-time, audited edit to the otherwise-immutable v8 baseline.
+ALWAYS_ON_SANCTIONED_EDITS: dict[str, tuple[tuple[str, str], ...]] = {
+    # #1530: install guidance must stay host-generic — do not tell agents to
+    # invoke a literal `skill` tool with `skill: "graphify"`, which is
+    # host-specific and not valid in every environment.
+    "_AGENTS_MD_SECTION": (
+        (
+            "When the user types `/graphify`, invoke the `skill` tool with "
+            '`skill: "graphify"` before doing anything else.',
+            "When the user types `/graphify`, use the installed graphify skill or instructions "
+            "before doing anything else.",
+        ),
+    ),
 }
 
 # The full six-value file_type enum (Decision A). Every rendered platform — split
@@ -151,6 +178,16 @@ _AGENTS_MD_HOOKS: dict[str, dict[str, str]] = {
         "host_display": "Amp",
         "install_block": "graphify amp install",
         "uninstall_block": "graphify amp uninstall  # remove the section",
+        "pretooluse_note": "",
+    },
+    "agents": {
+        # The generic cross-framework Agent-Skills target. Mirrors amp's bare,
+        # caveat-free agents-md section, worded for an unspecified host and
+        # pointing at `graphify agents install` (which wires AGENTS.md, like amp).
+        "heading_suffix": "",
+        "host_display": "your agent",
+        "install_block": "graphify agents install",
+        "uninstall_block": "graphify agents uninstall  # remove the section",
         "pretooluse_note": "",
     },
 }
@@ -545,6 +582,7 @@ def _git_show(ref: str) -> str:
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     if result.returncode != 0:
         raise SystemExit(f"error: could not read {ref}: {result.stderr.strip()}")
@@ -798,6 +836,47 @@ def _is_zero_node_guard_fix_line(line: str) -> bool:
     )
 
 
+def _is_manifest_root_fix_line(line: str) -> bool:
+    """Whether a line is part of the manifest-portability fix (#1417).
+
+    The monolith Step 9 called ``save_manifest(detect['files'])`` with no
+    ``root=``, so the manifest stored absolute path keys and a clone or move
+    broke ``--update`` — every cached file missed and the whole corpus
+    re-extracted. The call now threads ``root='INPUT_PATH'`` so keys are
+    relativized to the scan root, matching the native ``graphify update`` path.
+    Both the old bare call (removed) and the new rooted call (added) match here;
+    the ``import`` guard avoids matching the ``from graphify.detect import
+    save_manifest`` line.
+    """
+    return "save_manifest(" in line and "import" not in line
+
+
+def _is_no_api_key_fix_line(line: str) -> bool:
+    """Whether a line is part of the "no API key required" clarity (#1461).
+
+    The aider/devin monoliths described Step 3 semantic extraction without ever
+    stating that graphify needs no API key, and (like the subagent-host skills)
+    framed the no-key path only around dispatching subagents. Terminal hosts that
+    run the CLI directly and can't dispatch subagents looped for minutes insisting
+    on a missing key. A single blockquote added after the "two parts" line states
+    that no key is ever required and gives a non-subagent fallback.
+    """
+    return "graphify needs no API key" in line
+
+
+def _is_shebang_allowlist_fix_line(line: str) -> bool:
+    """Whether a line is part of the Homebrew ``python@`` shebang allowlist fix (#1586).
+
+    The interpreter-detection guard rejected any shebang containing a character
+    outside ``[!a-zA-Z0-9/_.-]``, but Homebrew installs versioned Python under
+    ``python@3.13``, so a valid interpreter path legitimately contains ``@`` and
+    detection fell through to a bare ``python3`` that lacked graphify. ``@`` is now
+    allowed, matching the #473 hooks.py fix; injection chars are still rejected.
+    Both the old (removed) and new (added) allowlist forms match here.
+    """
+    return "[!a-zA-Z0-9/_." in line
+
+
 # Every line that may differ between a rendered monolith and its pristine v8
 # baseline. Each predicate documents one sanctioned change-class; a blank line is
 # allowed because the multi-line fix blocks insert spacing. Anything else failing
@@ -810,6 +889,9 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_content_scope_fix_line,
     _is_cache_unlink_fix_line,
     _is_zero_node_guard_fix_line,
+    _is_manifest_root_fix_line,
+    _is_no_api_key_fix_line,
+    _is_shebang_allowlist_fix_line,
 )
 
 
@@ -903,10 +985,18 @@ def always_on_roundtrip() -> list[str]:
         if const_name not in baseline:
             problems.append(f"could not find constant {const_name} in {ALWAYS_ON_BASELINE_REF}")
             continue
-        if rendered[path] != baseline[const_name]:
+        expected = baseline[const_name]
+        for old, new in ALWAYS_ON_SANCTIONED_EDITS.get(const_name, ()):
+            if old not in expected:
+                problems.append(
+                    f"sanctioned edit for {const_name} no longer applies: "
+                    f"old text not found in {ALWAYS_ON_BASELINE_REF}"
+                )
+            expected = expected.replace(old, new)
+        if rendered[path] != expected:
             problems.append(
                 f"always_on/{basename}.md does not reproduce {const_name} byte for byte "
-                f"(rendered {len(rendered[path])} chars vs baseline {len(baseline[const_name])} chars)"
+                f"(rendered {len(rendered[path])} chars vs baseline {len(expected)} chars)"
             )
     return problems
 
